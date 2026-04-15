@@ -1,0 +1,12 @@
+[package]
+name = "data_cache_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+foyer = "0.22.3"
+num_cpus = "1.17.0"
+prometheus = "0.14.0"
+rand = { version = "0.10.1", features = ["thread_rng"] }
+tokio = { version = "1.52.0", features = ["full"] }

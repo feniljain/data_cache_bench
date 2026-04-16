@@ -1,71 +1,187 @@
+use std::time::Instant;
+
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
-    HybridCacheProperties, LfuConfig, Location,
+    HybridCachePolicy, HybridCacheProperties, LfuConfig, Location, RecoverMode,
 };
+use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 use prometheus::Registry;
+
+const METRICS_PORT: u16 = 9091;
+const TOTAL_SIZE: usize = 100 * 1024 * 1024 * 1024; // 100 GiB
+const ENTRY_SIZE: usize = 7 * 1024 * 1024; // 7 MiB
+const EXPECTED_ENTRIES: u32 = (TOTAL_SIZE / ENTRY_SIZE) as u32;
+
+enum Mode {
+    Execute,
+    Verify,
+}
+
+fn parse_mode() -> anyhow::Result<Mode> {
+    let arg = std::env::args().nth(1);
+    match arg.as_deref() {
+        Some("--execute") => Ok(Mode::Execute),
+        Some("--verify") => Ok(Mode::Verify),
+        other => {
+            anyhow::bail!(
+                "usage: data_cache_bench --execute | --verify (got {:?})",
+                other
+            )
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut data_buf = vec![0; 920000];
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
 
-    let total_size = 100_000_000_000; // 100GB
-    let mut size_cnt = 0;
-    let mut cnt = 1;
+    let mode = parse_mode()?;
+
+    let registry = Registry::new();
+    spawn_metrics_server(registry.clone());
 
     let flusher_count = num_cpus::get();
-    let entry_size = 7360000; // 7 MiB
-    let cache = init_foyer_cache(total_size, flusher_count, entry_size).await?;
-    let foyer_cache_props = HybridCacheProperties::default().with_location(Location::OnDisk);
+    let cache = init_foyer_cache(TOTAL_SIZE, flusher_count, ENTRY_SIZE, &registry).await?;
 
-    loop {
-        if size_cnt > total_size {
-            break;
-        }
+    match mode {
+        Mode::Execute => execute(&cache).await?,
+        Mode::Verify => verify(&cache).await?,
+    }
 
-        rand::fill(&mut data_buf[..]);
+    cache.close().await?;
+    Ok(())
+}
 
-        // write to cache
-        //
-        // foyer
-        cache.insert_with_properties(cnt, data_buf.clone(), foyer_cache_props.clone());
+async fn execute(cache: &HybridCache<u32, Vec<u8>>) -> anyhow::Result<()> {
+    let mut data_buf = vec![0u8; ENTRY_SIZE];
+    rand::fill(&mut data_buf[..]);
 
-        //
-        // custom
+    let props = HybridCacheProperties::default().with_location(Location::OnDisk);
+    let start = Instant::now();
+    let mut size_cnt: usize = 0;
+    let mut cnt: u32 = 1;
 
-        size_cnt += 920000;
+    while size_cnt < TOTAL_SIZE {
+        cache.insert_with_properties(cnt, data_buf.clone(), props.clone());
+        size_cnt += data_buf.len();
         cnt += 1;
     }
 
+    let elapsed = start.elapsed();
+    let mib = (size_cnt as f64) / (1024.0 * 1024.0);
+    println!(
+        "execute: wrote {} entries ({:.1} MiB) in {:.2?} ({:.1} MiB/s)",
+        cnt - 1,
+        mib,
+        elapsed,
+        mib / elapsed.as_secs_f64()
+    );
     Ok(())
+}
+
+async fn verify(cache: &HybridCache<u32, Vec<u8>>) -> anyhow::Result<()> {
+    let start = Instant::now();
+    let mut hits: u32 = 0;
+    let mut misses: Vec<u32> = Vec::new();
+
+    for key in 1..=EXPECTED_ENTRIES {
+        match cache.get(&key).await? {
+            Some(_) => hits += 1,
+            None => misses.push(key),
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let total = EXPECTED_ENTRIES;
+    let miss_count = misses.len() as u32;
+    let hit_rate = (hits as f64 / total as f64) * 100.0;
+    let mib = (hits as f64 * ENTRY_SIZE as f64) / (1024.0 * 1024.0);
+
+    println!("--- verification report ---");
+    println!("keys checked:   {total}");
+    println!("hits:           {hits}");
+    println!("misses:         {miss_count}");
+    println!("hit rate:       {hit_rate:.2}%");
+    println!("elapsed:        {elapsed:.2?}");
+    println!("read throughput: {:.1} MiB/s", mib / elapsed.as_secs_f64());
+
+    if !misses.is_empty() {
+        let preview: Vec<_> = misses.iter().take(10).collect();
+        println!("first missing keys: {preview:?}");
+    }
+
+    Ok(())
+}
+
+fn spawn_metrics_server(registry: Registry) {
+    tokio::spawn(async move {
+        use hyper::{
+            Body, Request, Response, Server, StatusCode,
+            service::{make_service_fn, service_fn},
+        };
+        use prometheus::{Encoder, TextEncoder};
+
+        let make_svc = make_service_fn(move |_| {
+            let reg = registry.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(service_fn(move |req: Request<Body>| {
+                    let reg = reg.clone();
+                    async move {
+                        let resp = match req.uri().path() {
+                            "/metrics" => {
+                                let encoder = TextEncoder::new();
+                                let mut buf = Vec::new();
+                                encoder.encode(&reg.gather(), &mut buf).unwrap();
+                                Response::builder()
+                                    .header(hyper::header::CONTENT_TYPE, encoder.format_type())
+                                    .body(Body::from(buf))
+                                    .unwrap()
+                            }
+                            _ => Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Body::from("not found"))
+                                .unwrap(),
+                        };
+                        Ok::<_, std::convert::Infallible>(resp)
+                    }
+                }))
+            }
+        });
+
+        let addr = ([0, 0, 0, 0], METRICS_PORT).into();
+        if let Err(e) = Server::bind(&addr).serve(make_svc).await {
+            eprintln!("metrics server error: {e}");
+        }
+    });
 }
 
 async fn init_foyer_cache(
     total_size: usize,
     flusher_count: usize,
     entry_size: usize,
+    registry: &Registry,
 ) -> anyhow::Result<HybridCache<u32, Vec<u8>>> {
-    let builder = HybridCacheBuilder::new();
+    let builder = HybridCacheBuilder::new()
+        // .with_policy(HybridCachePolicy::WriteOnInsertion)
+        .with_metrics_registry(Box::new(PrometheusMetricsRegistry::new(registry.clone())));
 
-    // TODO: expose foyer metrics with foyer prefix to local prom server
-    // accessible on localhost:9090
-    // if let Some(registry) = metrics_registry {
-    //     builder = builder.with_metrics_registry(registry);
-    // }
-
-    // We store nothing in memory
-    let memory_phase = builder.memory(0).with_eviction_config(LfuConfig::default());
-
-    let mut storage_phase = memory_phase.storage();
+    // memory(0): disk-only — WriteOnInsertion ensures entries go straight to disk
+    let memory_phase = builder.memory(1).with_eviction_config(LfuConfig::default());
 
     let device = FsDeviceBuilder::new("./foyer-data")
         .with_capacity(total_size)
         .build()?;
 
-    storage_phase = storage_phase.with_engine_config(
-        BlockEngineConfig::new(device)
-            .with_flushers(flusher_count)
-            .with_submit_queue_size_threshold(entry_size * flusher_count * 2),
-    );
+    let storage_phase = memory_phase
+        .storage()
+        .with_recover_mode(RecoverMode::Strict)
+        .with_engine_config(
+            BlockEngineConfig::new(device)
+                .with_flushers(flusher_count)
+                .with_submit_queue_size_threshold(entry_size * flusher_count * 2),
+        );
 
     let cache = storage_phase.build().await?;
 

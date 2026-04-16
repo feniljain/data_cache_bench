@@ -6,11 +6,29 @@ use foyer::{
 };
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 use prometheus::Registry;
+use tracing_subscriber::filter::LevelFilter;
 
 const METRICS_PORT: u16 = 9091;
-const TOTAL_SIZE: usize = 100 * 1024 * 1024 * 1024; // 100 GiB
+const TOTAL_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
 const ENTRY_SIZE: usize = 7 * 1024 * 1024; // 7 MiB
 const EXPECTED_ENTRIES: u32 = (TOTAL_SIZE / ENTRY_SIZE) as u32;
+
+// Things to try:
+// - Set entry size as block size
+// - Change submit queue threshold to depend on 16MB size instead
+// - Increase in-mem cache to hold just entry_size
+// - Increase in-mem cache to hold entry_size * 2
+// - Experiment with WriteOnInsert and WriteOnEviction more
+// - Find a way to check if something is written in files
+// - Do not use insert_with_props, if using in-mem cache with
+// higher size
+//
+// Things already tried:
+// - memory = 0 with WriteOnInsertion
+// - memory = ENTRY_SIZE with WriteOnInsertion
+// - memory = ENTRY_SIZE with WriteOnInsertion with no insert_with_props
+// - memory = ENTRY_SIZE with WriteOnEviction
+// - memory = ENTRY_SIZE with WriteOnEviction with no insert_with_props
 
 enum Mode {
     Execute,
@@ -34,7 +52,8 @@ fn parse_mode() -> anyhow::Result<Mode> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_max_level(LevelFilter::TRACE)
         .init();
 
     let mode = parse_mode()?;
@@ -43,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_metrics_server(registry.clone());
 
     let flusher_count = num_cpus::get();
-    let cache = init_foyer_cache(TOTAL_SIZE, flusher_count, ENTRY_SIZE, &registry).await?;
+    let cache = init_foyer_cache(TOTAL_SIZE, flusher_count, &registry).await?;
 
     match mode {
         Mode::Execute => execute(&cache).await?,
@@ -51,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     cache.close().await?;
+
     Ok(())
 }
 
@@ -58,19 +78,24 @@ async fn execute(cache: &HybridCache<u32, Vec<u8>>) -> anyhow::Result<()> {
     let mut data_buf = vec![0u8; ENTRY_SIZE];
     rand::fill(&mut data_buf[..]);
 
-    let props = HybridCacheProperties::default().with_location(Location::OnDisk);
+    let _props = HybridCacheProperties::default().with_location(Location::OnDisk);
     let start = Instant::now();
     let mut size_cnt: usize = 0;
     let mut cnt: u32 = 1;
 
+    print!("DEBUG::writing keys");
     while size_cnt < TOTAL_SIZE {
-        cache.insert_with_properties(cnt, data_buf.clone(), props.clone());
+        // cache.insert_with_properties(cnt, data_buf.clone(), props.clone());
+        print!("::{}", cnt);
+        cache.insert(cnt, data_buf.clone());
         size_cnt += data_buf.len();
         cnt += 1;
     }
+    println!();
 
     let elapsed = start.elapsed();
     let mib = (size_cnt as f64) / (1024.0 * 1024.0);
+
     println!(
         "execute: wrote {} entries ({:.1} MiB) in {:.2?} ({:.1} MiB/s)",
         cnt - 1,
@@ -115,6 +140,39 @@ async fn verify(cache: &HybridCache<u32, Vec<u8>>) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn init_foyer_cache(
+    total_size: usize,
+    flusher_count: usize,
+    registry: &Registry,
+) -> anyhow::Result<HybridCache<u32, Vec<u8>>> {
+    let builder = HybridCacheBuilder::new()
+        .with_policy(HybridCachePolicy::WriteOnInsertion)
+        .with_metrics_registry(Box::new(PrometheusMetricsRegistry::new(registry.clone())));
+
+    // we want to keep memory to min
+    let memory_phase = builder
+        .memory(ENTRY_SIZE)
+        .with_eviction_config(LfuConfig::default());
+
+    let device = FsDeviceBuilder::new("./foyer-data")
+        .with_capacity(total_size)
+        .build()?;
+
+    let storage_phase = memory_phase
+        .storage()
+        .with_recover_mode(RecoverMode::Strict)
+        .with_engine_config(
+            BlockEngineConfig::new(device)
+                .with_flushers(flusher_count)
+                .with_buffer_pool_size(ENTRY_SIZE * flusher_count * 2)
+                .with_submit_queue_size_threshold(ENTRY_SIZE * flusher_count * 2),
+        );
+
+    let cache = storage_phase.build().await?;
+
+    Ok(cache)
+}
+
 fn spawn_metrics_server(registry: Registry) {
     tokio::spawn(async move {
         use hyper::{
@@ -155,35 +213,4 @@ fn spawn_metrics_server(registry: Registry) {
             eprintln!("metrics server error: {e}");
         }
     });
-}
-
-async fn init_foyer_cache(
-    total_size: usize,
-    flusher_count: usize,
-    entry_size: usize,
-    registry: &Registry,
-) -> anyhow::Result<HybridCache<u32, Vec<u8>>> {
-    let builder = HybridCacheBuilder::new()
-        // .with_policy(HybridCachePolicy::WriteOnInsertion)
-        .with_metrics_registry(Box::new(PrometheusMetricsRegistry::new(registry.clone())));
-
-    // memory(0): disk-only — WriteOnInsertion ensures entries go straight to disk
-    let memory_phase = builder.memory(1).with_eviction_config(LfuConfig::default());
-
-    let device = FsDeviceBuilder::new("./foyer-data")
-        .with_capacity(total_size)
-        .build()?;
-
-    let storage_phase = memory_phase
-        .storage()
-        .with_recover_mode(RecoverMode::Strict)
-        .with_engine_config(
-            BlockEngineConfig::new(device)
-                .with_flushers(flusher_count)
-                .with_submit_queue_size_threshold(entry_size * flusher_count * 2),
-        );
-
-    let cache = storage_phase.build().await?;
-
-    Ok(cache)
 }

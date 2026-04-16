@@ -6,12 +6,13 @@ use foyer::{
 };
 use mixtrics::registry::prometheus_0_14::PrometheusMetricsRegistry;
 use prometheus::Registry;
-use tracing_subscriber::filter::LevelFilter;
 
 const METRICS_PORT: u16 = 9091;
 const TOTAL_SIZE: usize = 1 * 1024 * 1024 * 1024; // 1 GiB
 const ENTRY_SIZE: usize = 7 * 1024 * 1024; // 7 MiB
 const EXPECTED_ENTRIES: u32 = (TOTAL_SIZE / ENTRY_SIZE) as u32;
+// on-disk size: 8B length prefix + ENTRY_SIZE value + 4B key + 36B header, page-aligned
+const ALIGNED_ENTRY_SIZE: usize = ((ENTRY_SIZE + 8 + 4 + 36) + 4095) / 4096 * 4096;
 
 // Things to try:
 // - Set entry size as block size
@@ -52,8 +53,8 @@ fn parse_mode() -> anyhow::Result<Mode> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        // .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_max_level(LevelFilter::TRACE)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // .with_max_level(LevelFilter::TRACE)
         .init();
 
     let mode = parse_mode()?;
@@ -164,7 +165,7 @@ async fn init_foyer_cache(
         .with_engine_config(
             BlockEngineConfig::new(device)
                 .with_flushers(flusher_count)
-                .with_buffer_pool_size(ENTRY_SIZE * flusher_count * 2)
+                .with_buffer_pool_size(ALIGNED_ENTRY_SIZE * flusher_count * 3)
                 .with_submit_queue_size_threshold(ENTRY_SIZE * flusher_count * 2),
         );
 
